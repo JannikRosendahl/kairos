@@ -24,84 +24,278 @@ Experiments in the repo:
 
 ## 1. The shared DARPA pipeline
 
-All six DARPA TC experiments follow the same five stages. Only the regexes,
-the label fields and the edge-type lists differ.
+All six DARPA TC experiments run the same five stages. Only the gates, the label
+fields and the edge-type lists differ.
 
-1. **Parse.** Raw CDM JSON is read **line by line as text** and matched with
-   `re.findall`. There is no JSON parsing and no schema validation; a record is
-   selected by a substring test (`if "NetFlowObject" in line`) and its fields by a
-   positional regex. A record whose regex does not match is silently dropped
-   (bare `except: pass`).
-2. **Three node tables only** — `file_node_table`, `subject_node_table`,
-   `netflow_node_table` (`DARPA/settings/database.md`). Every other CDM entity type
-   (Principal, MemoryObject, SrcSinkObject, UnnamedPipeObject, IpcObject, RegistryKey,
-   Host, Tag/provenance records) is never imported.
-3. **Node identity = SHA-256 of a label string.** `stringtomd5()` is named for MD5 but
-   calls `hashlib.sha256` (`DARPA/CADETS_E3/create_database.py:21`). The digest of a
-   *label* (path / exec / cmdline / 4-tuple) is the node key, and `node2id` is keyed on
-   it. **UUIDs are therefore not node identity** — every entity sharing a label collapses
-   into one node (see §5.1).
-4. **Dense index.** `node2id` assigns `index_id` by insertion order, always
-   files → subjects → netflows. This integer is the TGN memory slot.
-5. **Vectorize per day.** One `TemporalData` per calendar day, edges filtered by type,
-   `msg = [ src_feat(16) | edge_onehot(k) | dst_feat(16) ]`.
+1. **Select** a raw JSON line by a **substring test** (§1.1) — no JSON parsing, no
+   schema validation.
+2. **Extract** fields by positional **regex** (§1.3). Non-matching records are dropped
+   silently (`except: pass`).
+3. **Key** each node on `sha256(label)` — not on its UUID (§5.1).
+4. **Index**: `node2id` assigns a dense `index_id` in insertion order, always
+   files → subjects → netflows. That integer is the TGN memory slot.
+5. **Vectorize** per calendar day into one `TemporalData`, filtering edges by type (§1.4).
 
-### 1.1 Node features
+### 1.1 Record selection — every gate, verbatim
 
-Identical in all six (`DARPA/CADETS_E3/embedding.py:23-77`, and the corresponding
-notebook cells):
+The gate is a Python substring test against the raw line. Full set:
 
-```python
-higlist = [<type token>] + path2higlist(label)   # or ip2higlist for netflow
-vec     = FeatureHasher(n_features=16, input_type="string").transform([list2str(higlist)])
-```
+| Experiment | Target | Exact condition | Where |
+| --- | --- | --- | --- |
+| CADETS E3 | netflow | `"NetFlowObject" in line` | `create_database.py:36` |
+| CADETS E3 | subject | `"Event" in line` | `create_database.py:77` |
+| CADETS E3 | file (pass 1, uuids) | `"com.bbn.tc.schema.avro.cdm18.FileObject" in line` | `create_database.py:105` |
+| CADETS E3 | file (pass 2, paths) | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.Event"' in line` | `create_database.py:116` |
+| CADETS E3 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.Event"' in line and "EVENT_FLOWS_TO" not in line` | `create_database.py:203` |
+| THEIA E3 | netflow | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.NetFlowObject"' in line` | cell [8] |
+| THEIA E3 | subject | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.Subject"' in line` | cell [11] |
+| THEIA E3 | file | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.FileObject"' in line` | cell [19] |
+| THEIA E3 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.Event"' in line and "EVENT_FLOWS_TO" not in line` | cell [27] |
+| CLEARSCOPE E3 | netflow | `"NetFlowObject" in line` | cell [5] |
+| CLEARSCOPE E3 | subject | `"schema.avro.cdm18.Subject" in line` | cell [8] |
+| CLEARSCOPE E3 | file | `"com.bbn.tc.schema.avro.cdm18.FileObject" in line` | cell [10] |
+| CLEARSCOPE E3 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm18.Event"' in line and "EVENT_FLOWS_TO" not in line` | cell [17] |
+| CADETS E5 | netflow | `"avro.cdm20.NetFlowObject" in line` | cell [7] |
+| CADETS E5 | subject + file (uuid registration) | `if "schema.avro.cdm20.Subject" in line: … elif "schema.avro.cdm20.FileObject" in line:` | cell [10] |
+| CADETS E5 | subject label | `"schema.avro.cdm20.Event" in line` **and** `relation_type in include_edge_type` | cell [12] |
+| CADETS E5 | file label | `"schema.avro.cdm20.Event" in line` **and** `relation_type in include_edge_type` | cell [16] |
+| CADETS E5 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm20.Event"' in line` | cell [25] |
+| THEIA E5 | netflow | `"NetFlowObject" in line` | cell [6] |
+| THEIA E5 | subject | `"schema.avro.cdm20.Subject" in line` | cell [9] |
+| THEIA E5 | file | `"avro.cdm20.FileObject" in line` | cell [12] |
+| THEIA E5 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm20.Event"' in line` | cell [21] |
+| CLEARSCOPE E5 | netflow | `"avro.cdm20.NetFlowObject" in line` | cell [5] |
+| CLEARSCOPE E5 | subject | `"schema.avro.cdm20.Subject" in line` | cell [8] |
+| CLEARSCOPE E5 | file | `"avro.cdm20.FileObject" in line` | cell [10] |
+| CLEARSCOPE E5 | event | `'{"datum":{"com.bbn.tc.schema.avro.cdm20.Event"' in line` | cell [18] |
+| OpTC | all | `temp_dic['object'] in node_type_used and is_selected_hosts(hostname)` (real `json.loads`) | cells [18], [22] |
 
-`path2higlist('/etc/passwd')` → `['', '/etc', '/etc/passwd']`, prefixed with the
-type token and **concatenated into one string** by `list2str`.
+Consequences of gating on substrings:
 
-**Verified**: with the pinned `scikit-learn==1.2.0`
-(`DARPA/settings/requirements.txt:32`), `FeatureHasher(input_type="string").transform([s])`
-where `s` is a `str` iterates the string **per character**. The node feature is therefore
-a 16-dim signed hash of a *character multiset*, not of the path components:
+- **CADETS E3 subjects are scraped from `Event` records, not `Subject` records.** The gate
+  is the bare string `"Event"`, which also matches any line where `Event` occurs in a
+  path or argument. Process identity comes from the `"exec"` field carried *on the event*.
+- **CADETS E3 file paths likewise come from `Event` records** (`predicateObjectPath`), not
+  from the `FileObject` record. `FileObject` records are read once, only to collect the
+  set of valid uuids.
+- **`EVENT_FLOWS_TO` is excluded by a whole-line substring test** in the three E3
+  pipelines — a record mentioning that string in any other field is also dropped. The
+  three **E5** pipelines have no such guard.
+- **CADETS E5 uses `elif`** (cell [10]): a line matching `…Subject` never reaches the
+  `FileObject` branch.
+- **Non-anchored gates** (`"NetFlowObject" in line`, `"schema.avro.cdm20.Subject" in line`)
+  match the type name anywhere in the record, including inside a nested reference, not
+  only in the datum position. The anchored form `'{"datum":{"com…X"' in line` is used
+  only by THEIA E3 and for the event gates.
+
+### 1.2 CDM record types → the three node tables
+
+`DARPA/settings/database.md` defines exactly three node tables for every DARPA
+experiment. Mapping:
+
+| Table | CDM record type | Columns kept | CDM subtypes collapsed into it |
+| --- | --- | --- | --- |
+| `subject_node_table` | `Subject` (cdm18/20) — via `Event.subject` in CADETS E3/E5 | CADETS/CLEARSCOPE: `node_uuid, hash_id, exec`⁄`cmdLine`; THEIA E3: `node_uuid, hash_id, cmdLine, tgid, path` | `SUBJECT_PROCESS`, `SUBJECT_THREAD`, `SUBJECT_UNIT`, `SUBJECT_BASIC_BLOCK` — **`Subject.type` is never read** |
+| `file_node_table` | `FileObject` | `node_uuid, hash_id, path` | `FILE_OBJECT_FILE`, `_DIR`, `_NAMED_PIPE`, `_UNIX_SOCKET`, `_PEFILE`, `_BLOCK`, `_CHAR`, `_LINK` — **`FileObject.type` is never read** |
+| `netflow_node_table` | `NetFlowObject` | `node_uuid, hash_id, src_addr, src_port, dst_addr, dst_port` | — |
+
+- The node **type token** that reaches the model is therefore 3-valued
+  (`file` / `subject` / `netflow`), coarser than CDM's own typing. A directory, a named
+  pipe and a regular file are indistinguishable; so are a process, a thread and a unit.
+- **CDM record types never imported** (present in the cdm18/cdm20 datum union):
+  `Principal`, `MemoryObject`, `SrcSinkObject`, `UnnamedPipeObject`, `IpcObject`,
+  `RegistryKeyObject`, `PacketSocketObject`, `ProvenanceTagNode`, `TagRunLengthTuple`,
+  `Value`, `CryptographicHash`, `UnitDependency`, `Host`, `TimeMarker`,
+  `StartMarker`/`EndMarker`.
+- Consequence: any event whose `predicateObject` is one of those types fails the
+  "both endpoints must resolve" test and is dropped along with it.
+
+### 1.3 Field extraction — the regexes
+
+**netflow** — identical shape everywhere; only the CDM value-wrapper differs.
+
+- cdm18 (CADETS E3, THEIA E3, CLEARSCOPE E3):
+  `'NetFlowObject":{"uuid":"(.*?)"(.*?)"localAddress":"(.*?)","localPort":(.*?),"remoteAddress":"(.*?)","remotePort":(.*?),'`
+- cdm20 (all E5): same, with `{"string":"…"}` / `{"int":…}` wrappers.
+- Captures → `srcaddr, srcport, dstaddr, dstport`. Identity = `sha256("src,sport,dst,dport")`;
+  **label written to `node2id` = `dst_addr:dst_port` only** (`create_database.py:170`).
+
+**subject**
+
+| Experiment | Regex | Label |
+| --- | --- | --- |
+| CADETS E3 | `'"subject":{"com.bbn.tc.schema.avro.cdm18.UUID":"(.*?)"}(.*?)"exec":"(.*?)"'` | `exec` |
+| THEIA E3 | `'Subject":{"uuid":"(.*?)"(.*?)"cmdLine":{"string":"(.*?)"}(.*?)"properties":{"map":{"tgid":"(.*?)"'` + `'"path":"(.*?)"'` | identity `cmdLine,tgid,path`; **feature `path`** |
+| CLEARSCOPE E3 | `'Subject":{"uuid":"(.*?)",(.*?)"cmdLine":{"string":"(.*?)"}'` | `cmdLine` |
+| CADETS E5 | `'"subject":{"com.bbn.tc.schema.avro.cdm20.UUID":"(.*?)"},(.*?)"exec":"(.*?)",'` | `exec` |
+| THEIA E5 | `'avro.cdm20.Subject":{"uuid":"(.*?)",(.*?)"path":"(.*?)"'` | `path` |
+| CLEARSCOPE E5 | `'avro.cdm20.Subject":{"uuid":"(.*?)",(.*?)"cmdLine":{"string":"(.*?)"}'` | `cmdLine` |
+
+**file**
+
+| Experiment | Regex | Label |
+| --- | --- | --- |
+| CADETS E3 | `'"predicateObjectPath":{"string":"(.*?)"'` (on Event lines) | `predicateObjectPath` |
+| THEIA E3 | `'FileObject":{"uuid":"(.*?)"(.*?)"filename":"(.*?)"'` | `filename` |
+| CLEARSCOPE E3 | `'FileObject":{"uuid":"(.*?)",(.*?)"path":"(.*?)"'` | `path` |
+| CADETS E5 | `'"predicateObjectPath":{"string":"(.*?)"}'` (on Event lines) | `predicateObjectPath` |
+| THEIA E5 | `'avro.cdm20.FileObject":{"uuid":"(.*?)",(.*?)"filename":"(.*?)"'` | `filename` |
+| CLEARSCOPE E5 | `'cdm20.FileObject":{"uuid":"(.*?)",(.*?){"map":{"path":"(.*?)"'` | `properties.map.path` |
+
+**event** — same four regexes in every experiment (cdm18/cdm20 differ only in the
+namespace, and THEIA E3/E5 omit the trailing `}`):
+
+- `'"subject":{"com.bbn.tc.schema.avro.cdmNN.UUID":"(.*?)"}'` → src uuid
+- `'"predicateObject":{"com.bbn.tc.schema.avro.cdmNN.UUID":"(.*?)"}'` → dst uuid
+- `'"type":"(.*?)"'` → edge type. **First match in the line**, not a keyed lookup.
+- `'"timestampNanos":(.*?),'` → `t`
+
+Everything else on the event record is discarded: `size`, `sequence`, `threadId`,
+`programPoint`, `predicateObject2` (so the second endpoint of two-object events is lost),
+`properties`, `hostId`, `location`, `name`, `parameters`.
+
+### 1.4 The edge-type lists
+
+Three separately-maintained lists, and they do not always agree:
+
+- `edge_reversed` / `reverse` — types whose direction is flipped at **import** so data
+  flows object → subject.
+- `include_edge_type` — the type filter.
+- `rel2id` — the one-hot vocabulary, and thus the **classifier's label set**.
+
+Per experiment (see §3.2 for the full matrix):
+
+- CADETS E3: filter = `include_edge_type` (7) at vectorization; `rel2id` also 7. ✔ consistent.
+- THEIA E3, CLEARSCOPE E3, THEIA E5, CLEARSCOPE E5: filter = `e[2] in rel2id`, i.e. the
+  one-hot vocabulary *is* the filter.
+- CADETS E5: `include_edge_type` (9) is used **twice** — once to decide which events may
+  supply node labels (§2.4), once as the graph filter; `rel2id` matches it.
+- CLEARSCOPE E5: `filter_type` (10) is applied at **DB insert**; `include_edge_type` is
+  dead code.
+- THEIA E5: `include_edge_type` (cell [19]) is dead code; `rel2id` (cell [29]) is the
+  real filter, and the two differ (`CLOSE` vs `CONNECT`).
+
+### 1.5 Features — the complete inventory
+
+Everything the model sees is in a `TemporalData` object with exactly four tensors:
+
+| Tensor | Dim | Source | Construction | Meaning |
+| --- | --- | --- | --- | --- |
+| `src`, `dst` | 1 each, `int64` | `node2id.index_id` | dense index, insertion order | TGN memory slot + `LastNeighborLoader` index |
+| `t` | 1, `int64` | `Event.timestampNanos` | verbatim | event time (ns; OpTC ms; StreamSpot row serial) |
+| `msg[0:16]` | 16, `float` | `node2id.msg` of **src** | §1.5.1 | hashed src label |
+| `msg[16:16+k]` | k, `float` | `event_table.operation` | `F.one_hot` over `rel2id` | edge type, k = 7…10 |
+| `msg[-16:]` | 16, `float` | `node2id.msg` of **dst** | §1.5.1 | hashed dst label |
+
+- **There is exactly one raw feature per node: its label string.** No numeric attribute
+  of any entity is featurized.
+- **Node features are static.** `node2higvec` is computed once over the whole corpus and
+  indexed by `index_id`; a node's 16 dims are identical in every event, on every day. All
+  temporal variation lives in the TGN memory, not in the inputs.
+- Sizes come from `config.py`: `node_embedding_dim=16`, `node_state_dim=100` (memory),
+  `time_dim=100`, `edge_dim=100` (GNN output), `neighbor_size=20`.
+
+Derived at model time, not stored:
+
+- `y_true` — the classification target, recovered from `msg[16:-16]` by
+  `tensor_find(...) - 1` (`train.py:53-55`).
+- `rel_t = last_update[src] - t`, fed to TGN's 100-d cosine time encoder (`model.py:28-29`).
+
+#### 1.5.1 How a node feature is built
+
+Six steps (`embedding.py:22-77`, and the equivalent notebook cells):
+
+1. `label = node2id.msg` for the node — a single string.
+2. `higlist = [type_token]`, where `type_token` is the **literal string**
+   `'file'`, `'subject'` or `'netflow'`. Node type is *not* a separate one-hot dimension;
+   it is three characters prepended to the label.
+3. Append the **hierarchical prefix expansion** of the label:
+   - `path2higlist(p)` — split on `/`, emit cumulative prefixes:
+     `'/etc/passwd'` → `['', '/etc', '/etc/passwd']`. Note the leading empty element for
+     absolute paths.
+   - `ip2higlist(p)` — same on `.`, used for netflow labels:
+     `'128.55.12.10:80'` → `['128', '128.55', '128.55.12', '128.55.12.10:80']`.
+   - `subject2higlist(p)` — a per-dataset copy, splitting on `.` **or** `/` (§1.5.3).
+4. `list2str(higlist)` — concatenate the whole list into **one string, no separator**.
+   Token boundaries are destroyed here.
+5. `FeatureHasher(n_features=16, input_type="string").transform([that_string])`.
+6. `np.array(...).reshape([-1,16])` → `node2higvec`, saved and indexed by `index_id`.
+
+#### 1.5.2 Step 5 hashes *characters*, not tokens — verified
+
+With the pinned `scikit-learn==1.2.0` (`DARPA/settings/requirements.txt:32`),
+`FeatureHasher(input_type="string").transform([s])` where `s` is a `str` iterates it
+**per character**. The resulting vector is a 16-bin signed character histogram:
 
 ```
 list2str           : 'file/etc/etc/passwd'
 KAIROS vector      : [ 0 -3  1 -1  0 -1 -1  3  0  0  0  1  1  0  0  1]
 anagram path       : 'file/etc/etc/psaswd'
 vector             : [ 0 -3  1 -1  0 -1 -1  3  0  0  0  1  1  0  0  1]   # identical
-token-level vector : [ 2  0  1  1  0  0  0  0  0  0  0  0  0  0  0  0]   # what it looks like it intends
+token-level vector : [ 2  0  1  1  0  0  0  0  0  0  0  0  0  0  0  0]   # the obvious reading
 ```
 
-`environment-settings.md:23` confirms this is load-bearing, not accidental:
-*"We encountered a problem in feature hashing functions with version 1.2.2"* —
-1.2.2 added the guard that rejects a bare string, so the pin preserves the
-character-level behaviour. Any port that passes a token list instead produces a
-**different feature space** and is not comparable to the published numbers.
+- `environment-settings.md:23` confirms the pin is load-bearing:
+  *"We encountered a problem in feature hashing functions with version 1.2.2"* — 1.2.2
+  added the guard that rejects a bare string.
+- What survives: character composition, and path depth as a *magnitude* (deeper paths
+  repeat their prefix characters more often).
+- What is lost: component boundaries, component order, and any distinction between
+  character anagrams.
+- A reimplementation passing a token list produces a different feature space and is not
+  comparable to the published numbers or pre-trained models.
 
-Consequences: the hierarchical prefix expansion survives only as a *magnitude*
-signal (deeper paths repeat their prefix characters more often); path structure,
-component boundaries and component order are all discarded; anagram paths are
-indistinguishable.
+#### 1.5.3 `subject2higlist` splits on a different character per dataset
 
-### 1.2 Edge features and the training target
+| Experiment | Subject label | Split char | Effect |
+| --- | --- | --- | --- |
+| CADETS E3 | `exec` | `/` (`path2higlist`) | bare binary name → 1 element |
+| THEIA E3 | `path` | `/` (`path2higlist`) | genuine path hierarchy |
+| CLEARSCOPE E3 | `cmdLine` | `.` | Android package hierarchy (`com.android.x`) |
+| CADETS E5 | `exec` | `.` | bare binary name → usually 1 element |
+| THEIA E5 | `path` | `/` | genuine path hierarchy |
+| CLEARSCOPE E5 | `cmdLine` | `/` | package-style label split on `/` — mostly 1 element |
 
-`msg` carries the edge-type one-hot in its middle segment, and the training label is
-recovered from that same segment (`train.py:53-56`, `tensor_find(m[16:-16], 1) - 1`).
-This is *not* direct leakage for the edge being predicted: `link_pred` sees only
-`z[src], z[dst]`, and `memory.update_state(..., msg)` runs **after** `pos_out` is
-computed. The current edge's type reaches the model only through the memory/neighbour
-state written by *earlier* edges. Worth stating explicitly in `Q-MA6`, since the
-`msg`-contains-the-label shape invites the opposite conclusion.
+CLEARSCOPE E3 and CLEARSCOPE E5 use the *same* label field with *different* split
+characters, so their subject features are not constructed the same way.
 
-### 1.3 Windowing and memory scope
+#### 1.5.4 Not featurized anywhere
 
-- Day graphs: `SELECT ... WHERE timestamp_rec > start AND timestamp_rec < end`, with
-  boundaries at **US/Eastern midnight** (`kairos_utils.py:74`, `datetime_to_ns_time_US`). Strict inequalities.
-- E3 loops `range(2, 14)` → 2018-04-02 … 2018-04-13; E5 loops `range(8, 18)` →
-  2019-05-08 … 2019-05-17. Anything outside is dropped at vectorization.
-- The 15-min analysis window is a *test-time* construct only
-  (`config.py:135`, `time_window_size = 60000000000 * 15`), applied at `test.py:115`.
-- **Memory is reset per day-graph**, in both `train()` (`train.py:33`) and `test()`
+- Event: `size`, `sequence`, `threadId`, `predicateObject2`, `programPoint`, `properties`.
+- Subject: pid/ppid (except THEIA E3's `tgid`, which enters identity but not features),
+  user/principal, start time, parent link, `cmdLine` where the label is `exec`/`path`.
+- File: CDM subtype, permissions, size, epoch.
+- Netflow: `src_addr`/`src_port` (identity only), byte counts, protocol, IP version.
+- Node degree, age, or any structural statistic.
+
+#### 1.5.5 Is the edge-type label leaked into the input?
+
+`msg` carries the edge-type one-hot in its middle segment, and the training target is
+decoded from that same segment — which invites the conclusion that the answer is in the
+input. It is not, for the edge being predicted:
+
+- `link_pred` sees only `z[assoc[src]], z[assoc[dst]]` — no `msg` of the current edge
+  (`train.py:49`).
+- `memory.update_state(src, pos_dst, t, msg)` runs **after** `pos_out` is computed
+  (`train.py:63`).
+- `gnn(...)` is fed `train_data.msg[e_id]` — the messages of *neighbour* edges drawn from
+  `LastNeighborLoader`, i.e. edges already seen.
+
+⇒ the current edge's type reaches the model only through memory and neighbour state
+written by **earlier** edges. Worth stating explicitly in `Q-MA6`, since the code shape
+argues the opposite.
+
+### 1.6 Windowing and memory scope
+
+- Day graphs:
+  `SELECT … WHERE timestamp_rec > start AND timestamp_rec < end ORDER BY timestamp_rec`
+  — strict inequalities, boundaries at **US/Eastern midnight**
+  (`kairos_utils.py:74`, `datetime_to_ns_time_US`).
+- E3 loops `range(2, 14)` → 2018-04-02 … 04-13; E5 loops `range(8, 18)` →
+  2019-05-08 … 05-17. Anything outside is dropped at vectorization.
+- The 15-min analysis window is **test-time only**
+  (`config.py:135`, `time_window_size = 60000000000 * 15`; applied at `test.py:115`).
+- **Memory is reset per day-graph** in both `train()` (`train.py:33`) and `test()`
   (`test.py:40`). TGN memory never carries across days; within a day it carries across
   the 15-min windows.
 
@@ -109,224 +303,153 @@ state written by *earlier* edges. Worth stating explicitly in `Q-MA6`, since the
 
 ## 2. Per-experiment detail
 
-### 2.1 CADETS E3 — `DARPA/CADETS_E3/`
+Gates and regexes are in §1.1/§1.3; this section is the per-experiment deltas.
 
-| | |
-| --- | --- |
-| **Nodes** | file, subject (process), netflow |
-| **Edges** | subject → (file ∣ netflow) only |
-| **msg dim** | 16 + **7** + 16 = 39 |
+### 2.1 CADETS E3 — `DARPA/CADETS_E3/` (the only scripted pipeline)
 
-**netflow** (`create_database.py:29`) — from any line containing `NetFlowObject`.
-Identity string `srcaddr,srcport,dstaddr,dstport`; **node label written to `node2id` is
-only `dstaddr:dstport`** (`create_database.py:170`). So two flows differing only in
-source port are distinct nodes with *identical* features. ≈155,322 rows.
-
-**subject** (`create_database.py:68`) — **not parsed from `Subject` records.** The uuid
-and executable are scraped out of *Event* lines with
-`'"subject":{...UUID":"(.*?)"}(.*?)"exec":"(.*?)"'`. Label = `exec`, i.e. the bare
-executable name. On regex failure the label becomes the literal string `"null"`.
-≈224,146 rows. No cmdline, no pid/tgid, no parent, no user.
-
-**file** (`create_database.py:100`) — two passes. Pass 1 collects all `FileObject`
-uuids. Pass 2 takes the path from *Event* lines, gated by:
-`'"predicateObjectPath":null,' not in line and '<unknown>' not in line`
-(`create_database.py:121`). ≈234,245 rows.
-- The `<unknown>` test is a **substring test over the whole JSON line**, so an
-  `<unknown>` anywhere in the record (any field) suppresses the path.
-- Last matching event wins — a file whose path is recorded differently across events
-  keeps the last one seen in file order.
-- Files never referenced by an event, or only with a null path, get **no row**, and
-  every event touching them is consequently dropped too.
-- `file_obj2hash[uuid]` stores the raw `re.findall` **list**; `create_database.py:128`
-  indexes `[0]`. A line that passes the gate but has no `predicateObjectPath` key at all
-  yields `[]` and raises — unguarded.
-
-**Events** (`create_database.py:198`) — line must contain
-`{"datum":{"com.bbn.tc.schema.avro.cdm18.Event"` and **must not contain
-`EVENT_FLOWS_TO` anywhere**. Both endpoints must already exist in the node tables. Kept
-attributes: `src_hash, src_index, type, dst_hash, dst_index, timestampNanos`.
-**Dropped**: `size`, `sequence`, `threadId`, `predicateObject2`, `programPoint`,
-`properties`, `hostId`.
-
-**Direction reversal** — `edge_reversed = [ACCEPT, RECVFROM, RECVMSG]` (`config.py:59`).
-
-**Graph filter** — `include_edge_type` = WRITE, READ, CLOSE, OPEN, EXECUTE, SENDTO,
-RECVFROM (`config.py:67`), applied at `embedding.py:105`.
-⚠️ **Inconsistency**: `EVENT_ACCEPT` and `EVENT_RECVMSG` are reversed on import but are
-**not** in `include_edge_type`, so both are discarded at vectorization — the reversal for
-those two types is dead code, and accept/recvmsg semantics never reach the model.
+- Nodes: file, subject, netflow. Edges: **subject → (file ∣ netflow)** only. `msg` = 16+**7**+16 = 39.
+- **Subjects come from Event records** (`create_database.py:68`), label = `exec`,
+  the bare executable name. Regex failure → the literal label `"null"`. ≈224,146 rows.
+- **File paths come from Event records** (`create_database.py:100`), gated by
+  `'"predicateObjectPath":null,' not in line and '<unknown>' not in line` (line 121):
+  - the `<unknown>` test is a **whole-line** substring test — an `<unknown>` in any other
+    field suppresses the path;
+  - **last matching event wins**;
+  - files never referenced, or only with a null path, get no row — and every event
+    touching them is dropped too;
+  - `file_obj2hash[uuid]` stores the raw `findall` **list**, indexed `[0]` at line 128 —
+    a line that passes the gate but has no `predicateObjectPath` key yields `[]` and raises.
+- Netflow: ≈155,322 rows; file: ≈234,245 rows; `node2id`: 268,242 entities
+  (`create_database.py:235-251`).
+- Reversal: `ACCEPT, RECVFROM, RECVMSG` (`config.py:59`).
+- Filter: `include_edge_type` = `WRITE, READ, CLOSE, OPEN, EXECUTE, SENDTO, RECVFROM`
+  (`config.py:67`), applied at `embedding.py:105`.
+- ⚠️ **`ACCEPT` and `RECVMSG` are reversed on import but absent from `include_edge_type`**
+  — both are discarded at vectorization, so the reversal is dead code and accept/recvmsg
+  semantics never reach the model.
 
 ### 2.2 THEIA E3 — `theia3_datapreprocess.ipynb`
 
-| | |
-| --- | --- |
-| **Edges** | subject → (file ∣ netflow ∣ **subject**) |
-| **msg dim** | 16 + **9** + 16 = 41 |
-
-- **subject** cell [11] — from real `Subject` records.
-  Identity = `sha256(cmdLine + "," + tgid + "," + path)`; table stores `cmdLine, tgid, path`.
-  **But `node2id.msg` = `path` only** (cell [22], `i[-1]`), so cmdline and tgid
-  contribute to *identity* but not to *features*: two nodes can be distinct and yet
-  carry byte-identical feature vectors. This is the only experiment where identity keys
-  on pid-ish information (`tgid`), i.e. the least node-collapse of the six.
-  `res = re.findall(...)[0]` is **not** inside the `try` — a Subject line without both
-  `cmdLine` and `tgid` raises and aborts the loop.
-- **file** cell [19] — label = `"filename"` (not `path`). FileObjects without a
-  `filename` field are silently skipped.
-- **Events** cell [27] — the only experiment permitting **subject→subject** edges
-  (`if objectid in subject2hash`). Endpoint resolution order is
-  `subject2hash → file2hash → netobj2hash`, each overwriting the previous: a uuid
-  present in more than one map resolves to the **last** match, not the first.
-  Excludes `EVENT_FLOWS_TO`.
-- **Reversal** = READ, READ_SOCKET_PARAMS, RECVFROM, RECVMSG.
-- **Graph filter** cell [42] = `e[2] in rel2id`, 9 types: CONNECT, EXECUTE, OPEN, READ,
-  RECVFROM, RECVMSG, SENDMSG, SENDTO, WRITE. (No CLOSE.)
+- Edges: **subject → (file ∣ netflow ∣ subject)** — the only experiment keeping
+  process→process edges. `msg` = 16+**9**+16 = 41.
+- Subjects from real `Subject` records. Identity = `sha256(cmdLine,tgid,path)`;
+  **`node2id.msg` = `path` only** (cell [22], `i[-1]`) → cmdline and tgid affect
+  *identity* but not *features*; distinct nodes can carry byte-identical vectors.
+- Least node collapse of the six (identity includes `tgid`).
+- `res = re.findall(...)[0]` is **not** inside the `try` (cell [11]) — a Subject line
+  lacking `cmdLine` or `tgid` raises and aborts the loop.
+- Files keyed on `filename`, not `path`; FileObjects without one are skipped.
+- Endpoint resolution order in cell [27] is `subject2hash → file2hash → netobj2hash`,
+  each overwriting the previous — a uuid in more than one map resolves to the **last** match.
+- Reversal: `READ, READ_SOCKET_PARAMS, RECVFROM, RECVMSG`.
+- Filter (cell [42]): `e[2] in rel2id` — `CONNECT, EXECUTE, OPEN, READ, RECVFROM,
+  RECVMSG, SENDMSG, SENDTO, WRITE`. No `CLOSE`.
 
 ### 2.3 CLEARSCOPE E3 — `clearscope3_datapreprocess.ipynb`
 
-| | |
-| --- | --- |
-| **Edges** | subject → (file ∣ netflow) |
-| **msg dim** | 16 + **8** + 16 = 40 |
-
-- **subject** cell [8] — label = `cmdLine`. A `Subject` record with a null `cmdLine`
-  fails both the `try` and the fallback → **the subject is dropped entirely**, and with
-  it every event that references it.
-- **file** cell [10] — label = `path`.
-- **Feature quirk** cell [20] — `subject2higlist` splits the cmdline on `'.'`
-  (Android package-name hierarchy) while files use `'/'`.
-- **Reversal** = ACCEPT, RECVFROM, RECVMSG. Excludes `EVENT_FLOWS_TO`.
-- **Graph filter** cell [33] = 8 types: CLOSE, OPEN, READ, WRITE, RECVFROM, RECVMSG,
-  SENDMSG, SENDTO.
+- Edges: subject → (file ∣ netflow). `msg` = 16+**8**+16 = 40.
+- Subject label = `cmdLine`. A `Subject` with null `cmdLine` fails both the `try` and
+  the fallback → **the subject is dropped entirely**, and with it all its events.
+- File label = `path`.
+- `subject2higlist` splits the cmdline on `.` (Android packages) while files use `/`.
+- Reversal: `ACCEPT, RECVFROM, RECVMSG`.
+- Filter (cell [33]): `CLOSE, OPEN, READ, WRITE, RECVFROM, RECVMSG, SENDMSG, SENDTO`.
 
 ### 2.4 CADETS E5 — `cadets5_datapreprocess.ipynb`
 
-| | |
-| --- | --- |
-| **Edges** | subject → (file ∣ netflow) |
-| **msg dim** | 16 + **9** + 16 = 41 |
-
-Two-pass registration, and the **edge-type filter feeds back into node selection**:
-
-- cell [10] registers every cdm20 `Subject` and `FileObject` uuid with the placeholder
-  `'none'`.
-- cell [12] fills subject labels from `"exec"` on Event lines — **only for events whose
-  type is in `include_edge_type`** (cell [6]).
-- cell [16] fills file labels from `predicateObjectPath`, again **only for included
-  event types**; missing path → `'null'`.
-- cell [14] drops every subject still `'none'`; cell [17] drops files that are `'none'`
-  **or** `'null'`.
-
-So a process or file that only ever participates in, say, `EVENT_CLONE` or
-`EVENT_MMAP` is not merely edge-filtered — it **does not exist as a node at all**.
-The node population is a function of the edge-type list.
-
-- **Events** cell [25] — **no `EVENT_FLOWS_TO` guard** (unlike the E3 notebooks).
-  Reversal = READ, RECVFROM, RECVMSG.
+- Edges: subject → (file ∣ netflow). `msg` = 16+**9**+16 = 41.
+- **Two-pass registration, and the edge-type filter decides which nodes exist:**
+  1. cell [10] registers every cdm20 `Subject` / `FileObject` uuid with placeholder `'none'`.
+  2. cell [12] fills subject labels from `"exec"` on Event lines — **only for events whose
+     type is in `include_edge_type`**.
+  3. cell [16] fills file labels from `predicateObjectPath`, same restriction;
+     missing path → `'null'`.
+  4. cell [14] drops every subject still `'none'`; cell [17] drops files that are
+     `'none'` **or** `'null'`.
+- ⇒ a process or file participating only in e.g. `EVENT_CLONE` or `EVENT_MMAP`
+  **does not exist as a node at all**. The node population, `max_node_num`, and the whole
+  index assignment are a function of the edge-type list.
+- No `EVENT_FLOWS_TO` guard (cell [25]). Reversal: `READ, RECVFROM, RECVMSG`.
 - Raw volume recorded in the notebook: `total_event_count: 1193669198`.
-- **Graph filter** cell [42] = 9 types: CLOSE, OPEN, READ, WRITE, EXECUTE, RECVFROM,
-  RECVMSG, SENDMSG, SENDTO. Days `range(8,18)`.
-- `subject2higlist` splits `exec` on `'.'`; files on `'/'`.
+- Filter (cell [42]): `CLOSE, OPEN, READ, WRITE, EXECUTE, RECVFROM, RECVMSG, SENDMSG, SENDTO`.
 
 ### 2.5 THEIA E5 — `theia5_datapreprocess.ipynb`
 
-| | |
-| --- | --- |
-| **Edges** | subject → (file ∣ netflow) |
-| **msg dim** | 16 + **9** + 16 = 41 |
-
-- **subject** cell [9] — label = `"path"` from the `Subject` record; records without a
-  path are dropped (both `try` branches fail).
-- **file** cell [12] — label = `"filename"`.
-- **Events** cell [21] — no `EVENT_FLOWS_TO` guard; no type filter at insert time.
-  Reversal = RECVFROM, RECVMSG, READ.
-- **Two different type lists coexist**: `include_edge_type` (cell [19], 9 types incl.
-  CLOSE, no CONNECT) is defined but **never used**; the graph filter (cell [38]) uses
-  `rel2id` — CONNECT, EXECUTE, OPEN, READ, RECVFROM, RECVMSG, SENDMSG, SENDTO, WRITE.
-  Net effect: `EVENT_CLOSE` is imported into Postgres but excluded from every graph.
-- `subject2higlist` splits on `'/'` here (unlike CADETS E5 / CLEARSCOPE E3).
+- Edges: subject → (file ∣ netflow). `msg` = 16+**9**+16 = 41.
+- Subject label = `"path"` from the `Subject` record; records without a path are dropped.
+- File label = `"filename"`.
+- No `EVENT_FLOWS_TO` guard, no type filter at insert time (cell [21]).
+  Reversal: `RECVFROM, RECVMSG, READ`.
+- **Two type lists coexist**: `include_edge_type` (cell [19], has `CLOSE`, no `CONNECT`) is
+  **never used**; the graph filter (cell [38]) uses `rel2id` (has `CONNECT`, no `CLOSE`).
+  ⇒ `EVENT_CLOSE` is imported into Postgres but excluded from every graph.
+- `subject2higlist` splits on `/`.
 
 ### 2.6 CLEARSCOPE E5 — `clearscope5_datapreprocess.ipynb`
 
-| | |
-| --- | --- |
-| **Edges** | subject → (file ∣ netflow) |
-| **msg dim** | 16 + **10** + 16 = 42 |
-
-- **subject** cell [8] — label = `cmdLine`; **file** cell [10] — label from
-  `{"map":{"path":"..."`.
-- **Only experiment that filters edge types before the DB insert.** cells [19]–[20]
-  build `filter_type` and drop everything else *before* `insert into event_table`:
-  ACCEPT, CLONE, CLOSE, CREATE_OBJECT, EXECUTE, OPEN, READ, RECVFROM, SENDTO, WRITE.
-  The Postgres `event_table` is therefore already filtered — it is not a faithful
-  record of the log, unlike every other dataset.
-- `include_edge_type` (cell [17]) is defined but unused; `filter_type` wins.
-- **Reversal** = READ, RECVFROM, RECVMSG — note `EVENT_ACCEPT` is *kept* but **not
-  reversed**, the opposite of CADETS E3 / CLEARSCOPE E3.
-- `subject2higlist` splits on `'/'`.
+- Edges: subject → (file ∣ netflow). `msg` = 16+**10**+16 = 42.
+- Subject label = `cmdLine`; file label from `{"map":{"path":"…"`.
+- **Only experiment filtering edge types before the DB insert.** cells [19]–[20] build
+  `filter_type` and drop everything else *before* `insert into event_table`:
+  `ACCEPT, CLONE, CLOSE, CREATE_OBJECT, EXECUTE, OPEN, READ, RECVFROM, SENDTO, WRITE`.
+  ⇒ the Postgres `event_table` is **already filtered** — unlike every other dataset, it is
+  not a faithful record of the log, and the edge-type set cannot be widened without
+  re-parsing.
+- `include_edge_type` (cell [17]) is dead code; `filter_type` wins.
+- Reversal: `READ, RECVFROM, RECVMSG` — `ACCEPT` is **kept but not reversed**, the
+  opposite of CADETS E3 / CLEARSCOPE E3.
+- `subject2higlist` splits on `/` (CLEARSCOPE E3 splits the same field on `.`).
 
 ### 2.7 OpTC — `optc_datapreprocess.ipynb`
 
-Structurally different from all the DARPA TC pipelines.
+Structurally different from every DARPA TC pipeline.
 
-| | |
-| --- | --- |
-| **Schema** | one `event_table(src_id, src_type, edge_type, dst_id, dst_type, hostname, timestamp, data_label)` + `nodeid2msg`. No per-type node tables, no `node2id`. |
-| **Node identity** | **raw uuid** — the only experiment that does *not* hash a label |
-| **msg dim** | 16 + **10** + 16 = 42 |
-
-- **Nodes**: `actorID` is always typed `PROCESS`; the object is typed by the record's
+- **Real JSON parsing** (`json.loads`), not regex — the only one.
+- Schema: one `event_table(src_id, src_type, edge_type, dst_id, dst_type, hostname,
+  timestamp, data_label)` + `nodeid2msg`. **No per-type node tables, no `node2id`.**
+- **Node identity = raw uuid** — the only experiment that does not hash a label.
+  `msg` = 16+**10**+16 = 42.
+- Node types: `actorID` is always typed `PROCESS`; the object is typed by the record's
   `object` field, restricted to `node_type_used = {FILE, FLOW, PROCESS}` (cell [5];
-  `SHELL` is commented out). `MODULE, REGISTRY, TASK, THREAD, USER_SESSION` never enter.
-- **Labels** are host-prefixed, `"<host>_@<path>"`:
-  process → `properties.image_path`; FILE → `properties.file_path`;
-  FLOW → `"<direction>#<src_ip>:<src_port>-><dest_ip>:<dest_port>"`.
-  A record missing the relevant property makes `process_raw_dic` return `{}` (bare
-  `except`) and the whole event is dropped.
+  `SHELL` commented out). `MODULE, REGISTRY, TASK, THREAD, USER_SESSION` never enter.
+- Labels are host-prefixed, `"<host>_@<path>"`:
+  - process → `properties.image_path`
+  - FILE → `properties.file_path`
+  - FLOW → `"<direction>#<src_ip>:<src_port>-><dest_ip>:<dest_port>"`
+  - a record missing the property makes `process_raw_dic` return `{}` (bare `except`) and
+    the whole event is dropped.
 - **PROCESS objects never get a label written** — only actors do. A process that is only
-  ever an object (e.g. the target of a `TERMINATE`) has no `nodeid2msg` entry, and every
-  edge touching it is dropped at vectorization
-  (`if e[3] not in node_uuid2path ... continue`).
-- **Host allow-list** (`is_selected_hosts`) — and it is **redefined between the two
-  import cells**: benign import (cell [17]) uses
-  `0201, 0402, 0660, 0501, 0051, 0209`; evaluation import (cell [21]) swaps
-  `0209 → 0207`.
-- **Timestamps are milliseconds**, not nanoseconds (`datetime_to_timestamp_US`,
-  `timestamp*1000 + int(ms)`). Fractional-second handling assumes exactly a
-  `-04:00` suffix and a 3-digit fraction.
-- **Data modification before parsing**: `line = line.replace('\\\\','/')` — Windows
-  path separators are rewritten to `/` in the raw JSON text before `json.loads`.
-- `reverse_edge_type = ["READ"]` is declared (cell [5]) and **never applied** — OpTC
-  edges are never reversed.
-- **Node indices are per-graph.** Each `(day, host, data_label)` graph rebuilds
-  `node_uuid2index` from 0. The same uuid gets different integers in different graphs.
-  Memory is reset per graph (`train()` / `test_day_new()`), so this is self-consistent,
-  but it means **no memory or index continuity across host-days at all**.
-- Ground truth: `labels.csv` matched on `actorID`/`objectID`, restricted to actions in
-  `edge2vec`.
+  ever an object (e.g. the target of a `TERMINATE`) has no `nodeid2msg` entry and every
+  edge touching it is dropped at vectorization.
+- **Host allow-list `is_selected_hosts` is redefined between the two import cells**:
+  benign (cell [17]) = `0201, 0402, 0660, 0501, 0051, 0209`;
+  evaluation (cell [21]) swaps `0209 → 0207`.
+- **Timestamps are milliseconds** (`timestamp*1000 + int(ms)`), not nanoseconds; parsing
+  assumes exactly a `-04:00` suffix and a 3-digit fraction.
+- **Raw text modified before parsing**: `line = line.replace('\\\\','/')` — Windows
+  separators rewritten to `/`.
+- `reverse_edge_type = ["READ"]` is declared (cell [5]) and **never applied** — OpTC edges
+  are never reversed.
+- **Node indices are per-graph**: each `(day, host, data_label)` rebuilds
+  `node_uuid2index` from 0. Memory is reset per graph, so it is self-consistent, but there
+  is **no memory or index continuity across host-days**.
+- Ground truth: `labels.csv` matched on `actorID`/`objectID`, restricted to actions in `edge2vec`.
 
 ### 2.8 StreamSpot — `StreamSpot/src/preprocess.py`
 
-- Input is already an edge list; the TSV is inserted **verbatim** into `raw_data`
+- Input is already an edge list; the TSV is inserted **verbatim**
   (`preprocess.py:35-45`). **No filtering, no exclusion, no relabelling.**
-- Nodes = the ids from the file. Features are **8-dim one-hot node types** and
-  **26-dim one-hot edge types** — no hashing, no paths (`preprocess.py:109-121`).
-  `msg` dim = 8 + 26 + 8 = 42.
+- Features are **one-hot only** — 8-dim node type, 26-dim edge type, no hashing, no paths
+  (`preprocess.py:109-121`). `msg` = 8+26+8 = 42.
 - **No timestamps exist.** `t` is the Postgres `_id` serial, i.e. row order
   (`preprocess.py:140`, comment: *"Use logical order of the event to represent the time"*).
-  Every StreamSpot "temporal" result is therefore over a synthetic integer ordering.
-- ⚠️ **Non-deterministic encoding**: `node_type` and `edge_type` are Python `set`s and
-  the one-hot index is assigned by iteration order (`preprocess.py:47-107` and `112-121`). With
-  string-hash randomisation the mapping differs between interpreter runs. It is
-  internally consistent because one `preprocess.py` process writes all 600 graphs — but
-  a re-run produces a *different* encoding, so the published pre-trained model is
-  incompatible with freshly preprocessed data.
+- ⚠️ **Non-deterministic encoding**: `node_type` / `edge_type` are Python `set`s and the
+  one-hot index is assigned by iteration order (`preprocess.py:47-107`, `112-121`). With
+  string-hash randomisation the mapping differs between interpreter runs. It is internally
+  consistent (one process writes all 600 graphs), but a re-run produces a *different*
+  encoding, so the published pre-trained model is incompatible with freshly preprocessed data.
 - Split (`train.py:29-34`, `test.py:148-263`): train on graphs 0, 100, 200, 400, 500;
-  validate on 505 and ranges 1–24/101–124/201–224/401–424/501–524; test includes
-  300–399 (the attack batch).
-
----
+  validate on 505 and 1–24/101–124/201–224/401–424/501–524; test includes 300–399 (attacks).
 
 ## 3. Cross-experiment comparison
 
@@ -430,7 +553,7 @@ claim about "stateful node memory" in KAIROS is a claim about memory per *label 
 not per entity — and that differs by dataset, which makes cross-dataset comparison of
 the memory's contribution unsound as published.
 
-### 5.2 Node features are character-level hashes (§1.1)
+### 5.2 Node features are character-level hashes (§1.5.2)
 
 Verified against the pinned sklearn. Paths that are character anagrams are
 indistinguishable; the hierarchical expansion only survives as magnitude. A
@@ -533,7 +656,7 @@ Not import-stage, but they operate on the imported data and belong in the same a
 
 ## 7. Reproduction note
 
-The character-level feature-hashing finding (§1.1) was verified directly:
+The character-level feature-hashing finding (§1.5.2) was verified directly:
 
 ```
 uv venv --python 3.9 && uv pip install "scikit-learn==1.2.0" "numpy<2"
