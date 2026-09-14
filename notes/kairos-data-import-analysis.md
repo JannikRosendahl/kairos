@@ -201,31 +201,133 @@ Derived at model time, not stored:
   `tensor_find(...) - 1` (`train.py:53-55`).
 - `rel_t = last_update[src] - t`, fed to TGN's 100-d cosine time encoder (`model.py:28-29`).
 
-#### 1.5.1 How a node feature is built
+#### 1.5.1 What a node's *label* is, and how it becomes sixteen numbers
 
-Six steps (`embedding.py:22-77`, and the equivalent notebook cells):
+**A node's label is its one and only raw attribute.** It is a single string held in
+`node2id.msg` — column 3 of `node2id(hash_id, node_type, msg, index_id)`
+(`DARPA/settings/database.md`) — written once by `create_node_list`
+(`create_database.py:135-186`) and read back by `gen_nodeid2msg`
+(`kairos_utils.py:117-126`) as `nodeid2msg[index_id] = {node_type: label}`. Everything
+else the CDM record carried is discarded at this point (§1.5.4).
 
-1. `label = node2id.msg` for the node — a single string.
-2. `higlist = [type_token]`, where `type_token` is the **literal string**
-   `'file'`, `'subject'` or `'netflow'`. Node type is *not* a separate one-hot dimension;
-   it is three characters prepended to the label.
-3. Append the **hierarchical prefix expansion** of the label:
-   - `path2higlist(p)` — split on `/`, emit cumulative prefixes:
-     `'/etc/passwd'` → `['', '/etc', '/etc/passwd']`. Note the leading empty element for
-     absolute paths.
-   - `ip2higlist(p)` — same on `.`, used for netflow labels:
-     `'128.55.12.10:80'` → `['128', '128.55', '128.55.12', '128.55.12.10:80']`.
-   - `subject2higlist(p)` — a per-dataset copy, splitting on `.` **or** `/` (§1.5.3).
-4. `list2str(higlist)` — concatenate the whole list into **one string, no separator**.
-   Token boundaries are destroyed here.
-5. `FeatureHasher(n_features=16, input_type="string").transform([that_string])`.
-6. `np.array(...).reshape([-1,16])` → `node2higvec`, saved and indexed by `index_id`.
+| Node type | What the label string *is* | Typical value | Source field |
+| --- | --- | --- | --- |
+| `subject` | the process's executable or command string | `sshd`, `/usr/bin/curl`, `com.android.chrome` | `exec` / `path` / `cmdLine`, per experiment (§1.3) |
+| `file` | the object's path or file name | `/etc/passwd`, `libc.so.6` | `predicateObjectPath` / `path` / `filename`, per experiment (§1.3) |
+| `netflow` | the **remote endpoint only**, `dst_addr + ":" + dst_port` | `128.55.12.10:80` | `remoteAddress`, `remotePort` (`create_database.py:170`) |
+
+Three properties of the label that propagate into everything downstream:
+
+- **The label is also the identity key.** `hash_id = sha256(label)`
+  (`create_database.py:23-27`), and `node2id` is keyed on `hash_id`, so two entities with
+  the same label *are the same node* — one row, one `index_id`, one TGN memory slot
+  (§5.1). The label therefore fixes both *who* a node is and *what the model sees* of it.
+- **Except in the two places where identity and label diverge.** netflow identity is
+  `sha256("src,sport,dst,dport")` while the label drops `src` entirely; THEIA E3 subject
+  identity is `sha256("cmdLine,tgid,path")` while the label is `path` alone (§5.6). In
+  those two cases distinct nodes routinely carry byte-identical labels, hence
+  byte-identical features.
+- **A failed extraction becomes a literal string, not a missing value.** CADETS E3,
+  CLEARSCOPE E3 and THEIA E5 write the four characters `null` when the subject regex does
+  not match (`create_database.py:85`); every such process collapses into *one* node
+  labelled `null` with one feature vector. CADETS E5 is the exception: it seeds
+  `subject_uuid2path[uuid] = 'none'` and drops entries that never got overwritten
+  (cell [14]).
+
+**From label to vector — the six steps** (`embedding.py:48-77`; the notebooks inline the
+same code: THEIA E3 cell [30], CLEARSCOPE E3 cell [21], CADETS E5 cell [30], THEIA E5
+cell [26], CLEARSCOPE E5 cell [25]):
+
+| # | Step | Input → output |
+| --- | --- | --- |
+| 1 | look up the label | `index_id` → `nodeid2msg[i]` → `{node_type: label}`; one `str` |
+| 2 | seed with the type token | `higlist = [node_type]`, the **literal string** `'file'` / `'subject'` / `'netflow'`. The type is *not* a separate one-hot dimension — it is 4–7 characters prepended to the label |
+| 3 | hierarchical prefix expansion | label → list of cumulative prefixes. `path2higlist` splits on `/`, `ip2higlist` on `.`, `subject2higlist` on `.` or `/` depending on the dataset (§1.5.3). `'/etc/passwd'` → `['', '/etc', '/etc/passwd']`; `'128.55.12.10:80'` → `['128', '128.55', '128.55.12', '128.55.12.10:80']` |
+| 4 | `list2str` | the whole list concatenated into **one string with no separator**. Token boundaries are destroyed here: `['file', '', '/etc', '/etc/passwd']` → `'file/etc/etc/passwd'` |
+| 5 | `FeatureHasher(n_features=16, input_type="string").transform([s])` | one string → a 16-wide sparse row. With the pinned scikit-learn this hashes **characters**, not tokens (§1.5.2) |
+| 6 | `np.array(...).reshape([-1,16])` | one row per node, appended in `nodeid2msg` iteration order, which is ascending `index_id` because `gen_nodeid2msg` runs `ORDER BY index_id`. Saved as `node2higvec`, indexed positionally by `index_id` |
+
+Worked examples (reproduced by `code/scratchpad/kairos_feature_hasher.py` in the thesis
+umbrella repo, which reimplements steps 3–5 without sklearn):
+
+| Label | `higlist` | `list2str` | `node2higvec[i]` |
+| --- | --- | --- | --- |
+| file `/etc/passwd` | `['file', '', '/etc', '/etc/passwd']` | `'file/etc/etc/passwd'` (19 ch) | `[0,-3,1,-1,0,-1,-1,3,0,0,0,1,1,0,0,1]` |
+| subject `sshd` | `['subject', 'sshd']` | `'subjectsshd'` (11 ch) | `[1,-1,0,0,0,0,0,0,0,0,0,0,0,-2,0,-3]` |
+| subject `/usr/bin/curl` | `['subject', '', '/usr', '/usr/bin', '/usr/bin/curl']` | `'subject/usr/usr/bin/usr/bin/curl'` (32 ch) | `[5,2,0,-1,-2,-2,0,0,0,0,0,0,1,-3,0,2]` |
+| netflow `128.55.12.10:80` | `['netflow', '128', '128.55', '128.55.12', '128.55.12.10:80']` | `'netflow128128.55128.55.12128.55.12.10:80'` (40 ch) | `[0,-3,0,0,5,0,1,7,0,-5,0,1,1,-13,0,0]` |
+
+Two step-3 details worth recording. The leading `''` that `path2higlist` emits for an
+absolute path is **inert** — it contributes no characters in step 5, so the "hierarchy"
+of `/etc/passwd` is effectively two elements, not three. And a label with no split
+character (`sshd`, most CADETS `exec` values) expands to a one-element list, so the
+hierarchical step is a no-op and the feature is just the character histogram of
+`'subject' + label`.
+
+**What the sixteen resulting features actually are.** They are *not* sixteen named
+attributes. There is exactly one input — the expanded label string `s` from step 4 — and
+feature `j` is the signed count of the characters of `s` whose hash lands in bin `j`:
+
+```
+f_j = Σ_{c ∈ chars(s)}  sign(h(c)) · [ |h(c)| mod 16 == j ],   h = MurmurHash3-x86-32(c, seed=0)
+```
+
+Because `h` is evaluated per character and the contributions are summed, the whole vector
+is a **fixed linear map of the label's character histogram**: `f = M · count(s)`, where
+`M ∈ {-1,0,+1}^{16×|alphabet|}` is a constant. The bin-and-sign assignment over the
+characters that dominate real labels:
+
+| Feature (bin) | Characters that feed it, with sign |
+| --- | --- |
+| 0 | +`6` +`u` |
+| 1 | -`-` -`0` +`9` -`c` +`r` -`w` |
+| 2 | +`a` |
+| 3 | +`_` +`d` +`o` -`t` |
+| 4 | +`3` +`5` -`n` |
+| 5 | -`i` |
+| 6 | +`:` -`p` +`y` |
+| 7 | +`2` +`e` -`j` |
+| 8 | -`4` +`7` -`q` |
+| 9 | -`8` -`z` |
+| 10 | -`g` |
+| 11 | +`f` -`v` +`x` |
+| 12 | +`l` +`m` |
+| 13 | -`.` -`1` -`b` -`h` |
+| 14 | — unreachable from `[a-z0-9/.:_-]`; only `A`, `O`, `U`, `'`, `=` reach it |
+| 15 | +`/` -`k` -`s` |
+
+So, concretely: *feature 15 is (count of `/`) − (count of `k`) − (count of `s`)*, feature
+2 is the count of `a`, feature 13 is minus the count of `.`,`1`,`b`,`h`. Eight of the
+fifteen reachable bins mix both signs, so characters inside a bin cancel; for
+lowercase-only labels feature 14 is identically zero.
+
+The node type enters as a constant offset — the characters of the type token, added once:
+
+| Type token | Its contribution to every node of that type |
+| --- | --- |
+| `file` | `[0,0,0,0,0,-1,0,1,0,0,0,1,1,0,0,0]` |
+| `subject` | `[1,-1,0,-1,0,0,0,0,0,0,0,0,0,-1,0,-1]` |
+| `netflow` | `[0,-1,0,0,-1,0,0,1,0,0,0,1,1,0,0,0]` |
+
+These are not orthogonal and are not separable from the label's own contribution, so the
+model cannot read node type off the feature vector.
+
+**Dtype and scale.** `node2higvec` is float64 out of sklearn; `torch.cat` promotes it
+against the int64 one-hot and the `TemporalData` is cast to `float32`
+(`embedding.py:117,126`). No normalisation is applied anywhere:
+`torch_geometric.transforms.NormalizeFeatures` and `sklearn.preprocessing` are imported
+in every preprocessing notebook and **never called**, and `train.py`/`test.py` contain
+no scaling. The values reaching TGN are therefore raw small signed integers whose
+magnitude grows with label length (see §1.5.2).
 
 #### 1.5.2 Step 5 hashes *characters*, not tokens — verified
 
 With the pinned `scikit-learn==1.2.0` (`DARPA/settings/requirements.txt:32`),
 `FeatureHasher(input_type="string").transform([s])` where `s` is a `str` iterates it
-**per character**. The resulting vector is a 16-bin signed character histogram:
+**per character**, because a `str` is itself an iterable of strings. Each character is
+hashed with `murmurhash3_bytes_s32(c.encode(), 0)`, placed in bin `|h| mod 16`, and
+accumulated with sign `sign(h)` (`alternate_sign=True` is the default). The resulting
+vector is a 16-bin signed character histogram:
 
 ```
 list2str           : 'file/etc/etc/passwd'
@@ -235,15 +337,44 @@ vector             : [ 0 -3  1 -1  0 -1 -1  3  0  0  0  1  1  0  0  1]   # ident
 token-level vector : [ 2  0  1  1  0  0  0  0  0  0  0  0  0  0  0  0]   # the obvious reading
 ```
 
+- Verified by reimplementation: `code/scratchpad/kairos_feature_hasher.py` (thesis
+  umbrella repo) computes MurmurHash3-x86-32 directly, with no sklearn dependency, and
+  reproduces the vectors above exactly. Run it to regenerate every number in §1.5.1–1.5.2.
 - `environment-settings.md:23` confirms the pin is load-bearing:
   *"We encountered a problem in feature hashing functions with version 1.2.2"* — 1.2.2
   added the guard that rejects a bare string.
-- What survives: character composition, and path depth as a *magnitude* (deeper paths
-  repeat their prefix characters more often).
-- What is lost: component boundaries, component order, and any distinction between
-  character anagrams.
-- A reimplementation passing a token list produces a different feature space and is not
-  comparable to the published numbers or pre-trained models.
+
+**What survives.** Character composition; label length; and path depth as a *magnitude*,
+because the prefix expansion repeats each component once per level below it.
+
+**What is lost.**
+
+- *Component boundaries and order.* Any two labels that are character anagrams of their
+  expanded forms are indistinguishable. This is not hypothetical at the scale of a
+  process table: over the 1278 executable names on the machine this analysis ran on — the
+  exact shape of a CADETS `exec` label — 38 (3.0 %) share a vector with another name, e.g.
+  `bash`/`hash`/`sha1`, `ln`/`nl`/`nm`, `dd`/`od`/`rdoc`, `as`/`atos`/`sa`,
+  `hdiutil`/`hidutil`/`bioutil`. (Local-filesystem proxy: the DARPA `node2id` tables were
+  not reachable from this checkout, so this bounds the effect rather than measuring it on
+  the real corpus.)
+- *Digit order in netflow labels.* `10.0.0.1:443` and `10.0.0.1:434` hash identically.
+  Distinct octet orderings usually survive because the prefix expansion repeats them at
+  different multiplicities, but port permutations do not.
+- *Discriminative weight.* The prefix expansion repeats the **shallowest** component the
+  most: for `/usr/lib/systemd/system/foo.service` the leading `/usr` supplies 22 % of the
+  90 characters hashed while the basename `foo.service` supplies 13 %. The feature is
+  dominated by the least specific part of the path.
+- *Scale invariance.* Vector magnitude grows super-linearly with depth — quadratically,
+  for components of similar length. As `file` labels, `‖f‖₁` is 6, 12, 20, 30 for `/usr`,
+  `/usr/lib`, `/usr/lib/x`, `/usr/lib/x/y`, and the netflow example in §1.5.1 already
+  reaches −13 in feature 13. Since nothing normalises (§1.5.1), a deep path and a short
+  one differ far more in norm than in direction.
+
+**Consequence for a reimplementation.** Passing a token list (`FH.transform([higlist])`)
+instead of the concatenated string produces a different, higher-rank feature space. It is
+arguably the intended encoding, but it is *not* what produced the published numbers, and
+a model trained on it is not comparable to KAIROS' released checkpoints. Any port of this
+pipeline must state which of the two it uses.
 
 #### 1.5.3 `subject2higlist` splits on a different character per dataset
 
