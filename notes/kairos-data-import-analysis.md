@@ -293,11 +293,58 @@ argues the opposite.
   (`kairos_utils.py:74`, `datetime_to_ns_time_US`).
 - E3 loops `range(2, 14)` → 2018-04-02 … 04-13; E5 loops `range(8, 18)` →
   2019-05-08 … 05-17. Anything outside is dropped at vectorization.
-- The 15-min analysis window is **test-time only**
-  (`config.py:135`, `time_window_size = 60000000000 * 15`; applied at `test.py:115`).
+- The 15-min analysis window is **test-time only**. `time_window_size` is defined once
+  (`config.py:135`, `60000000000 * 15`) and read exactly once (`test.py:115`); `train.py`
+  contains **zero** references to it. Training iterates a whole day-graph as one flat
+  event stream (`train.py:37`, `seq_batches(batch_size=BATCH)`, `BATCH = 1024` at
+  `config.py:124`). The notebooks inline the same constant, always inside the *test*
+  function — THEIA E3 **cell [11]** l.119, CLEARSCOPE E3 **cell [14]** l.107,
+  CADETS E5 **cell [18]** l.108 (`60000000000*15`); OpTC **cell [17]** l.99 uses
+  `60000*15` because its timestamps are in **ms**, not ns.
 - **Memory is reset per day-graph** in both `train()` (`train.py:33`) and `test()`
   (`test.py:40`). TGN memory never carries across days; within a day it carries across
-  the 15-min windows.
+  the 15-min windows. In training the reset fires once **per day-graph per epoch**
+  (`train.py:117-126`).
+
+⇒ the only structural discretisation during representation learning is the **calendar
+day**. The 15-minute window is an evaluation/alerting granularity layered on a continuous
+per-day event stream. This matters when positioning KAIROS as a "static time-window
+snapshot" system: that label fits its *detection* stage, not its encoder, which consumes
+the day as a continuous event stream. Worth re-checking against the ORTHRUS note before
+drawing the contrast in the chapter.
+
+#### 1.6.1 Windows are ≥15 min, snapped to batch boundaries
+
+The boundary is tested once per 1024-event batch (`test.py:115`), and on flush
+`start_time = t[-1]` (`test.py:140`) sets the next window's origin to the *actual*
+overshoot point — so error accumulates rather than snapping back to a grid. A window
+closes at the first batch end **after** 15 min have elapsed, and in a quiet period a
+single batch can span hours.
+
+Measured over the 454 windows logged in `theia3_graph_learning.ipynb` **cells [12]–[18]**:
+
+| statistic | minutes |
+| --- | --- |
+| median | 15.48 |
+| mean | 15.68 |
+| max | 28.9 |
+| within 1 s of 15:00 | 32 / 454 |
+| > 16 min | 120 / 454 |
+
+CADETS E3 is sparser and drifts much further. The hand-listed ground-truth attack windows
+(`evaluation.py:47-52`, duplicated at `:80-85`) span:
+
+```
+11:18:26.126 ~ 11:33:35.116    15m 09s
+11:33:35.116 ~ 11:48:42.606    15m 07s
+11:48:42.606 ~ 12:03:50.186    15m 08s
+12:03:50.186 ~ 14:01:32.489    1h 57m 42s   <- one "15-minute" window
+```
+
+Nothing downstream normalises for this: one `.txt` file is one unit of evaluation
+regardless of the span it covers, so a window's weight in the metrics is independent of
+its duration. Quoting "15-minute windows" as the evaluation unit is therefore accurate
+only nominally.
 
 ---
 
@@ -495,6 +542,53 @@ Structurally different from every DARPA TC pipeline.
 Note that the E3/E5 test days overlap the train days
 (`CADETS_E3/test.py:146-156` re-runs 4-03…4-05 to seed the node-IDF statistics before
 testing on 4-06 and 4-07).
+
+The `window (test)` column is the *nominal* setting; realised windows are ≥15 min and
+drift (§1.6.1).
+
+#### 3.3.1 Graph sizes and window counts (THEIA E3)
+
+`theia3_datapreprocess.ipynb` **cell [42]** preserves its run output, so the per-day sizes
+are exact (events fetched → edges kept after the type filter of §1.4). The CADETS E3 `.py`
+pipeline ships no logs, so these are the only first-party size numbers in the repo.
+
+| Day | events | edges kept | role | test windows |
+| --- | --- | --- | --- | --- |
+| 04-03 | 9,799,359 | 8,230,837 | **train** | 54 |
+| 04-04 | 6,672,049 | 4,930,304 | **train** | 93 |
+| 04-05 | 2,127,824 | 1,489,011 | **train** | 47 |
+| 04-09 | 712,059 | 685,635 | test | 33 |
+| 04-10 | 6,389,285 | 6,274,151 | test (attack) | 43 |
+| 04-11 | 7,511,085 | 7,285,220 | test | 91 |
+| 04-12 | 7,293,214 | 7,024,937 | test | 93 |
+| 04-13 | 3,895,125 | 3,759,064 | unused | — |
+
+04-02 and 04-06…04-08 return 0 events and yield empty graphs.
+
+Training is therefore **3 day-graphs, 14.65M edges**, ≈14,300 batches per epoch. Window
+counts are the IDF loops' tqdm totals — one `.txt` file per window —
+`theia3_graph_learning.ipynb` **cell [20]** (194 = 54+93+47 over 04-03…04-05),
+**cell [21]** (43, 04-10), **cell [22]** (91, 04-11), **cell [23]** (93, 04-12); the
+per-day split of the 194 is from the logged window lines in **cells [12]–[14]**. Day
+04-03 has only 54 windows despite being the largest graph because its data starts at
+10:02, not midnight — partial days are common and window counts are not comparable
+across days.
+
+#### 3.3.2 Epoch counts differ by experiment
+
+`epoch_num = 50` (`config.py:131`) governs CADETS E3 only. THEIA E3 also uses 50
+(`theia3_graph_learning.ipynb` **cell [10]**, `range(1, 51)`), but CLEARSCOPE E3
+(**cell [10]**), CADETS E5 (**cell [13]**), THEIA E5 (**cell [12]**) and CLEARSCOPE E5
+(**cell [10]**) all use **30** (`range(1, 31)`), and OpTC uses **10** (**cell [16]**) over
+six per-host 9-22 graphs. Do not quote 50 as a system-wide figure.
+
+#### 3.3.3 Evaluated window totals
+
+Paper Table 4 (`resources/KAIROS.txt:1025-1060`) gives E3-CADETS TP 4 / TN 174 / FP 1 /
+FN 0 → **179 windows** scored across the two test days (04-06, 04-07). A perfect 15-min
+grid over two days would be 192; the shortfall is the drift of §1.6.1. TP = 4 matches the
+four hand-listed attack windows exactly, confirming the ground truth is exhaustive rather
+than sampled.
 
 ---
 

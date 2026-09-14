@@ -5,7 +5,8 @@ covers record selection, featurisation and the exclusion catalogue. This note co
 **model**: what the encoder computes, how memory is scoped, and where the paper and the
 code disagree.
 
-Analysed at commit `68685ceb59bc15db81b8b5ca3057411c198bd708` (2026-09-08).
+Analysed at commit `68685ceb59bc15db81b8b5ca3057411c198bd708` (2026-09-08);
+training/evaluation granularity pass (§3.2 addendum, §3.4, §3.5) added 2026-09-14.
 Scripted pipeline is `DARPA/CADETS_E3/`; all line references are to that directory
 unless stated. Paper text: `resources/KAIROS.txt`.
 
@@ -129,8 +130,17 @@ The claim that KAIROS hides its window size does **not** survive checking. `[pap
 adds "We find |tw| = 15 minutes to be ideal among all datasets". `[read]` The code
 agrees: `config.py:133-135`, `time_window_size = 60000000000 * 15`.
 
-The genuine code-only findings are §2 (per-day memory reset), §3.3 (keying) and §4
-(filters) — not the window size.
+The genuine code-only findings are §2 (per-day memory reset), §3.3 (keying), §3.4 (β),
+§3.5 (IDF seeding) and §4 (filters) — not the window size.
+
+What the paper does *not* state is that the window is inert during training and that the
+realised windows are not 15 minutes. `time_window_size` has exactly one reader,
+`test.py:115`; `train.py` never mentions it. And because the boundary is only tested once
+per 1024-event batch with `start_time = t[-1]` on flush (`test.py:140`), windows are
+≥15 min with accumulating drift — median 15.48 min, max 28.9 min over the 454 logged
+THEIA E3 windows, and one CADETS E3 ground-truth attack window spans 1 h 58 m
+(`evaluation.py:51`). `[import-note]` §1.6.1. So "15-minute time window" is a nominal
+setting, not the realised evaluation unit.
 
 ### 3.3 Node identity is `sha256(label)`, not the UUID
 
@@ -156,12 +166,48 @@ unsound as published. This is the deepest single finding about KAIROS.
 
 ---
 
+### 3.4 β is hardcoded, not set from validation
+
+`[paper]` `resources/KAIROS.txt:719-722`: "KAIROS uses benign validation data to set β
+after model training."
+
+`[read]` The released code does not do this. `config.py:144-145` sets
+`beta_day6 = 100` and `beta_day7 = 100` as literals. `evaluation.py:100-119` *does*
+compute the maximum queue anomaly score over the validation day (`graph_4_5`) — and then
+only logs it (`:119`); the value is never assigned to β. The test-day comparisons at
+`evaluation.py:142` and `:160` read the hardcoded constants.
+
+Two consequences. The threshold is a **per-test-day** parameter — `beta_day6` and
+`beta_day7` are independent knobs that merely happen to both be 100 — which is a degree
+of freedom the paper does not describe. And the validation day does no threshold-setting
+work at all in the artifact, so the reported numbers cannot be reproduced *via* the
+documented procedure, only via the constants.
+
+### 3.5 The node-IDF statistics are seeded on training days
+
+`[read]` `test.py:146-156` replays 04-03, 04-04 and 04-05 before the test days, commented
+"graph_4_3 - graph_4_5 will be used to initialize node IDF scores". Two of those three
+(04-03, 04-04) are **training** days (`train.py:73-76` loads 04-02…04-04).
+
+The IDF denominator is `len(file_list)`, the count of *those* windows
+(`anomalous_queue_construction.py:83`), and the rareness test is
+`IDF > log(len(tw_list) * 0.9)` (`:132`). The rareness threshold that gates suspicious
+nodes is therefore calibrated on windows the model was trained on. `[paper]` Table 12
+(`resources/KAIROS.txt:2514-2555`) lists 04-05 alone as validation for E3-CADETS and says
+nothing about replaying training days.
+
+---
+
 ## 4. Detection, thresholding and evaluation
 
 `[import-note]` unless marked.
 
-- 15-minute windows are applied at **test time only** (`test.py:115`); graphs are built
-  per calendar day at US/Eastern midnight.
+- 15-minute windows are applied at **test time only** (`test.py:115`, the sole reader of
+  `time_window_size`; `train.py` has none); graphs are built per calendar day at
+  US/Eastern midnight. Realised windows are ≥15 min and drift — median 15.48 min, max
+  28.9 min across 454 logged THEIA E3 windows `[import-note]` §1.6.1.
+- **179 windows** are scored for E3-CADETS (paper Table 4: TP 4 / TN 174 / FP 1 / FN 0)
+  across two test days, against 192 for an exact 15-min grid.
 - Anomaly threshold per window: `mean + 1.5·std`
   (`anomalous_queue_construction.py:29`).
 - **Keyword denylist chosen from test data.** `cal_set_rel` zeroes the IDF of nodes
@@ -185,7 +231,13 @@ unsound as published. This is the deepest single finding about KAIROS.
 ### Splits (CADETS E3) `[import-note]`
 
 Train `graph_4_2..4_4`; IDF/validation `graph_4_3..4_5`; test `graph_4_6`, `graph_4_7`.
-Chronological, unlike ORTHRUS — but note validation overlaps training days 3–4.
+Chronological, unlike ORTHRUS — but note validation overlaps training days 3–4 (§3.5),
+and the validation day never sets a threshold anyway (§3.4).
+
+Training consumes **3 whole-day graphs**, not windows. First-party sizes exist only for
+THEIA E3 `[import-note]` §3.3.1: 8.23M + 4.93M + 1.49M = **14.65M edges**, ≈14,300
+batches of 1024 per epoch, ×50 epochs. Epoch count is *not* uniform across experiments —
+50 for CADETS/THEIA E3, 30 for the other E3/E5 notebooks, 10 for OpTC (§3.3.2).
 
 ---
 
@@ -202,8 +254,12 @@ Chronological, unlike ORTHRUS — but note validation overlaps training days 3�
 | `lr` | 0.00005 | 127 |
 | `epoch_num` | 50 | 131 |
 | `time_window_size` | 15 min (ns) | 133-135 |
+| `beta_day6` / `beta_day7` | 100 / 100 | 144-145 |
 
 No argparse, no YAML — every script reads these module-level constants directly.
+`epoch_num` and `time_window_size` are CADETS E3 values; the notebooks inline their own
+(§3.3.2 of the import note). `beta_day6`/`beta_day7` are the detection thresholds the
+paper claims are derived from validation data (§3.4).
 
 ---
 
@@ -217,7 +273,8 @@ No argparse, no YAML — every script reads these module-level constants directl
 | Encoder | TGN memory + UniMP (`TransformerConv` ×2) |
 | Proxy task | edge-type prediction, 7 classes on CADETS E3 (paper says 9) |
 | Granularity | scored at **time-window** level |
-| Window | 15 min, test-time only; day-graphs for construction |
+| Training unit | **whole calendar day** — windows play no part in training |
+| Window | 15 min *nominal*, test-time only; realised ≥15 min, median 15.5, max 28.9 |
 | Thresholding | `mean + 1.5·std` per window, plus a test-derived keyword denylist |
 
 ---
