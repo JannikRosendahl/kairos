@@ -5,6 +5,22 @@ covers record selection, featurisation and the exclusion catalogue. This note co
 **model**: what the encoder computes, how memory is scoped, and where the paper and the
 code disagree.
 
+Three further notes were split out on 2026-09-14 when the thesis section's open `\todo`s
+were worked through; they supersede the corresponding stubs here:
+
+- [`graph-transformation-and-featurisation.md`](graph-transformation-and-featurisation.md)
+  — what happens between raw records and the tensor (no fusion; process→process edges
+  dropped), and what the 16-d node feature actually is (a character histogram).
+- [`objective-and-memory-lifecycle.md`](objective-and-memory-lifecycle.md) — the loss, the
+  absence of negative sampling, and what crosses the train→test boundary (nothing but
+  weights).
+- [`detection-thresholding-and-ground-truth.md`](detection-thresholding-and-ground-truth.md)
+  — the scored unit (≈179 windows, not 4), every threshold, and the ground-truth
+  convention.
+- [`metrics-splits-and-reported-results.md`](metrics-splits-and-reported-results.md) — the
+  reported numbers, the imbalance, and **how the "adjusted" table is produced** (§4's last
+  open item, now closed).
+
 Analysed at commit `68685ceb59bc15db81b8b5ca3057411c198bd708` (2026-09-08);
 training/evaluation granularity pass (§3.2 addendum, §3.4, §3.5) added 2026-09-14.
 Scripted pipeline is `DARPA/CADETS_E3/`; all line references are to that directory
@@ -225,8 +241,12 @@ nothing about replaying training days.
 - Loss-accumulation bug at `test.py:128-131`: the reported per-window loss is
   `(last_batch_loss + Σ edge losses) / event_count`. Affects the logged window loss, not
   the per-edge losses that drive detection.
-- `[unverified]` How the paper's "adjusted" results table is produced. This is the one
-  remaining material paper↔code delta not yet run down.
+- ~~`[unverified]` How the paper's "adjusted" results table is produced.~~ **Resolved
+  2026-09-14**: it is a hand relabelling of the ground truth — FPs the authors judge to be
+  "fake" are reclassified as TPs. Predictions never change (TN identical and TP+FP
+  conserved in every row), no code produces it, and the supplementary material does not
+  derive it. E3-CADETS is unaffected. See
+  [`metrics-splits-and-reported-results.md`](metrics-splits-and-reported-results.md) §3.2.
 
 ### Splits (CADETS E3) `[import-note]`
 
